@@ -8,6 +8,14 @@ Render deploy: binds 0.0.0.0 + $PORT automatically. Set env vars:
   KALSHI_KEY_ID, KALSHI_PRIVATE_KEY_PATH (point at a Render Secret File)
 
 SAFETY DEFAULTS: dry_run=True, enable_trading=False. Demo host only.
+
+FIX (2026-07-21): Kalshi's /markets endpoint returns yes_bid_dollars /
+yes_ask_dollars / no_bid_dollars / no_ask_dollars directly on each market
+object (confirmed via docs.kalshi.com changelog -- legacy integer-cents
+fields like yes_bid were deprecated). Reading prices straight off /markets
+is simpler and cheaper than a separate orderbook call, so that's now the
+primary path; a per-market orderbook call is kept only as a fallback for
+markets missing those fields.
 """
 
 from __future__ import annotations
@@ -21,8 +29,8 @@ import re
 import threading
 import time
 import uuid
-from dataclasses import dataclass, field
-from datetime import datetime
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Optional
 from urllib.parse import urlparse
@@ -49,8 +57,6 @@ class CityConfig:
     station: str
 
 
-# Approximate public station coordinates. Verify against api.weather.gov
-# if a specific city's forecast looks misaligned with its settlement station.
 ALL_CITIES: list[CityConfig] = [
     CityConfig("Atlanta", 33.6407, -84.4277, "KXHIGHTATL", "KXLOWTATL", "KATL"),
     CityConfig("Austin", 30.1975, -97.6664, "KXHIGHAUS", "KXLOWTAUS", "KAUS"),
@@ -74,8 +80,6 @@ ALL_CITIES: list[CityConfig] = [
     CityConfig("Washington D.C.", 38.8512, -77.0402, "KXHIGHTDC", "KXLOWTDC", "KDCA"),
 ]
 
-# Start small; add more names once you've confirmed rate limits & ticker
-# accuracy. Must match `.name` exactly from ALL_CITIES above.
 ENABLED_CITIES = ["Chicago", "New York City", "Miami"]
 
 
@@ -99,7 +103,7 @@ class Config:
 
     edge_threshold: float = 0.05
     max_order_contracts: int = 1
-    poll_interval_sec: int = 300  # longer default given multi-city rate-limit cost
+    poll_interval_sec: int = 300
 
     dry_run: bool = True
     enable_trading: bool = False
@@ -107,8 +111,14 @@ class Config:
     dashboard_host: str = "0.0.0.0"
     dashboard_port: int = int(os.environ.get("PORT", 8787))
 
+    # Logs the raw JSON of the first market per series once, on the first
+    # cycle only -- useful for confirming field names if pricing ever
+    # looks wrong again. Flip to False once you've confirmed it's working.
+    debug_log_first_market: bool = True
+
 
 CONFIG = Config()
+_debug_logged_series: set[str] = set()
 
 
 # =============================================================================
@@ -118,7 +128,7 @@ CONFIG = Config()
 STATE_LOCK = threading.Lock()
 STATE: dict[str, Any] = {
     "last_updated": None,
-    "cities": {},          # name -> {high: {...}, low: {...}}
+    "cities": {},
     "balance_dollars": None,
     "positions": [],
     "recent_orders": [],
@@ -129,7 +139,7 @@ STATE: dict[str, Any] = {
 def update_state(**kwargs: Any) -> None:
     with STATE_LOCK:
         STATE.update(kwargs)
-        STATE["last_updated"] = datetime.utcnow().isoformat() + "Z"
+        STATE["last_updated"] = datetime.now(timezone.utc).isoformat()
 
 
 def set_city_state(city_name: str, key: str, value: Any) -> None:
@@ -141,7 +151,7 @@ def push_error(msg: str) -> None:
     logger.error(msg)
     with STATE_LOCK:
         errs = STATE["errors"]
-        errs.append({"time": datetime.utcnow().isoformat() + "Z", "message": msg})
+        errs.append({"time": datetime.now(timezone.utc).isoformat(), "message": msg})
         STATE["errors"] = errs[-30:]
 
 
@@ -170,9 +180,8 @@ def get_todays_projected_extreme(forecast_hourly_url: str, mode: str) -> float:
     """
     mode: "max" for today's high, "min" for today's low.
     NOTE: overnight lows often settle against the *next* calendar day on
-    Kalshi, not the same day as this pull -- this is a simplification, not
-    an exact match to Kalshi's settlement window. Treat with appropriate
-    skepticism for the low-temp series specifically.
+    Kalshi -- this is a simplification, not an exact match to Kalshi's
+    settlement window.
     """
     resp = requests.get(
         forecast_hourly_url,
@@ -268,21 +277,8 @@ class KalshiClient:
                 break
         return markets
 
-    def get_orderbooks_batched(self, tickers: list[str]) -> dict[str, dict]:
-        """Up to 100 tickers per call -- far cheaper than one call per market."""
-        if not tickers:
-            return {}
-        result: dict[str, dict] = {}
-        for i in range(0, len(tickers), 100):
-            chunk = tickers[i : i + 100]
-            data = self._request(
-                "GET", "/markets/orderbooks", params={"tickers": ",".join(chunk)}
-            ).json()
-            for ob in data.get("orderbooks", []):
-                ticker = ob.get("ticker")
-                if ticker:
-                    result[ticker] = ob
-        return result
+    def get_orderbook(self, ticker: str) -> dict:
+        return self._request("GET", f"/markets/{ticker}/orderbook").json()
 
     def get_balance(self) -> Optional[float]:
         try:
@@ -322,7 +318,7 @@ kalshi = KalshiClient(CONFIG.kalshi_base_url, CONFIG.kalshi_key_id, CONFIG.kalsh
 
 
 # =============================================================================
-# Bracket <-> market matching
+# Bracket <-> market matching + pricing
 # =============================================================================
 
 _RANGE_RE = re.compile(r"(\d{1,3})\s*(?:°|degrees)?\s*(?:-|to)\s*(\d{1,3})\s*(?:°|degrees)?")
@@ -343,18 +339,49 @@ def extract_bracket_from_market(market: dict) -> Optional[tuple[int, int]]:
     return None
 
 
-def best_yes_bid_ask(orderbook: dict) -> Optional[tuple[float, float]]:
-    book = orderbook.get("orderbook_fp") or orderbook.get("orderbook") or orderbook
-    yes_side = book.get("yes_dollars") or book.get("yes")
-    no_side = book.get("no_dollars") or book.get("no")
-    if not yes_side or not no_side:
+def _to_float(value: Any) -> Optional[float]:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def get_market_yes_quote(market: dict) -> Optional[tuple[float, float]]:
+    """
+    Returns (yes_bid, yes_ask) as dollar floats, read directly off the
+    market object from /markets. This is the current (2026) Kalshi schema:
+    yes_bid_dollars / yes_ask_dollars as dollar strings. Falls back to
+    legacy integer-cents fields (yes_bid, yes_ask) for older accounts,
+    then to a per-market orderbook call as a last resort.
+    """
+    yes_bid = _to_float(market.get("yes_bid_dollars"))
+    yes_ask = _to_float(market.get("yes_ask_dollars"))
+    if yes_bid is not None and yes_ask is not None:
+        return yes_bid, yes_ask
+
+    # Legacy integer-cents fallback (pre fixed-point migration).
+    yes_bid_c = market.get("yes_bid")
+    yes_ask_c = market.get("yes_ask")
+    if isinstance(yes_bid_c, (int, float)) and isinstance(yes_ask_c, (int, float)):
+        return yes_bid_c / 100.0, yes_ask_c / 100.0
+
+    # Last resort: hit the per-market orderbook endpoint.
+    ticker = market.get("ticker")
+    if not ticker:
         return None
     try:
+        orderbook = kalshi.get_orderbook(ticker)
+        book = orderbook.get("orderbook_fp", {})
+        yes_side = book.get("yes_dollars")
+        no_side = book.get("no_dollars")
+        if not yes_side or not no_side:
+            return None
         best_yes_bid = float(yes_side[-1][0])
         best_no_bid = float(no_side[-1][0])
-    except (IndexError, ValueError, TypeError):
+        return best_yes_bid, 1.0 - best_no_bid
+    except Exception as e:  # noqa: BLE001
+        push_error(f"orderbook fallback failed for {ticker}: {e}")
         return None
-    return best_yes_bid, 1.0 - best_no_bid
 
 
 # =============================================================================
@@ -370,20 +397,15 @@ def evaluate_series(mu: float, series_ticker: str) -> list[dict]:
         push_error(f"get_markets failed for {series_ticker}: {e}")
         markets = []
 
+    if CONFIG.debug_log_first_market and markets and series_ticker not in _debug_logged_series:
+        logger.info(f"DEBUG raw market sample for {series_ticker}: {json.dumps(markets[0])[:1500]}")
+        _debug_logged_series.add(series_ticker)
+
     market_by_range: dict[tuple[int, int], dict] = {}
     for m in markets:
         rng = extract_bracket_from_market(m)
         if rng:
             market_by_range[rng] = m
-
-    matched_tickers = [
-        m["ticker"] for m in market_by_range.values() if m.get("ticker")
-    ]
-    try:
-        orderbooks = kalshi.get_orderbooks_batched(matched_tickers)
-    except Exception as e:  # noqa: BLE001
-        push_error(f"batched orderbook fetch failed for {series_ticker}: {e}")
-        orderbooks = {}
 
     rows = []
     for low, high in brackets:
@@ -397,7 +419,7 @@ def evaluate_series(mu: float, series_ticker: str) -> list[dict]:
         }
 
         if market:
-            quote = best_yes_bid_ask(orderbooks.get(market["ticker"], {}))
+            quote = get_market_yes_quote(market)
             if quote:
                 yes_bid, yes_ask = quote
                 market_prob = (yes_bid + yes_ask) / 2
@@ -416,13 +438,15 @@ def evaluate_series(mu: float, series_ticker: str) -> list[dict]:
                     )
                 else:
                     row["action"] = "within edge threshold, no trade"
+            else:
+                row["action"] = "no price data"
         rows.append(row)
     return rows
 
 
 def place_order_if_enabled(ticker, side, action, price_dollars, count, reason) -> None:
     log_entry = {
-        "time": datetime.utcnow().isoformat() + "Z", "ticker": ticker, "side": side,
+        "time": datetime.now(timezone.utc).isoformat(), "ticker": ticker, "side": side,
         "action": action, "price": price_dollars, "count": count, "reason": reason,
         "dry_run": CONFIG.dry_run, "sent": False, "response": None,
     }
