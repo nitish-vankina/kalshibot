@@ -86,8 +86,8 @@ class Config:
     enable_trading: bool = False     # True required (in addition to dry_run=False) to send
 
     # --- Dashboard ---
-    dashboard_host: str = "127.0.0.1"
-    dashboard_port: int = 8787
+   dashboard_host: str = "0.0.0.0"
+   dashboard_port: int = int(os.environ.get("PORT", 8787))
 
 
 CONFIG = Config()
