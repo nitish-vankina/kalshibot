@@ -422,27 +422,39 @@ def evaluate_series(mu: float, series_ticker: str) -> list[dict]:
             quote = get_market_yes_quote(market)
             if quote:
                 yes_bid, yes_ask = quote
-                market_prob = (yes_bid + yes_ask) / 2
-                edge = model_prob - market_prob
-                row["market_prob"] = market_prob
-                row["edge"] = edge
 
-                if abs(edge) >= CONFIG.edge_threshold:
-                    side = "yes" if edge > 0 else "no"
-                    limit_price = yes_ask if side == "yes" else round(1 - yes_bid, 2)
-                    row["action"] = f"EDGE: buy {side.upper()} @ ~{limit_price:.2f}"
-                    place_order_if_enabled(
-                        ticker=market["ticker"], side=side, action="buy",
-                        price_dollars=limit_price, count=CONFIG.max_order_contracts,
-                        reason=f"{series_ticker} model={model_prob:.3f} market={market_prob:.3f} edge={edge:+.3f}",
-                    )
+                # A near-full-width spread (e.g. bid=0.00, ask=1.00) means
+                # no one has actually posted an order on either side --
+                # it's an empty book default, not a real market price.
+                # Trading against it means buying at the worst possible
+                # price with no counterparty conviction behind it.
+                spread = yes_ask - yes_bid
+                is_empty_book = (yes_bid <= 0.005 and yes_ask >= 0.995) or spread >= 0.60
+
+                if is_empty_book:
+                    row["market_prob"] = (yes_bid + yes_ask) / 2
+                    row["action"] = "thin/no liquidity, skipped"
                 else:
-                    row["action"] = "within edge threshold, no trade"
+                    market_prob = (yes_bid + yes_ask) / 2
+                    edge = model_prob - market_prob
+                    row["market_prob"] = market_prob
+                    row["edge"] = edge
+
+                    if abs(edge) >= CONFIG.edge_threshold:
+                        side = "yes" if edge > 0 else "no"
+                        limit_price = yes_ask if side == "yes" else round(1 - yes_bid, 2)
+                        row["action"] = f"EDGE: buy {side.upper()} @ ~{limit_price:.2f}"
+                        place_order_if_enabled(
+                            ticker=market["ticker"], side=side, action="buy",
+                            price_dollars=limit_price, count=CONFIG.max_order_contracts,
+                            reason=f"{series_ticker} model={model_prob:.3f} market={market_prob:.3f} edge={edge:+.3f}",
+                        )
+                    else:
+                        row["action"] = "within edge threshold, no trade"
             else:
                 row["action"] = "no price data"
         rows.append(row)
     return rows
-
 
 def place_order_if_enabled(ticker, side, action, price_dollars, count, reason) -> None:
     log_entry = {
